@@ -63,38 +63,6 @@ host_commonLdlibs += -lrt -ldl
 endif
 
 
-# For the host
-# =====================================================
-include $(CLEAR_VARS)
-LOCAL_SRC_FILES:= $(commonSources)
-ifeq ($(HOST_OS), linux)
-LOCAL_SRC_FILES += Looper.cpp
-endif
-LOCAL_MODULE:= libutils
-LOCAL_STATIC_LIBRARIES := libz
-LOCAL_C_INCLUDES := \
-	external/zlib
-LOCAL_CFLAGS += $(host_commonCflags)
-LOCAL_LDLIBS += $(host_commonLdlibs)
-include $(BUILD_HOST_STATIC_LIBRARY)
-
-
-# For the host, 64-bit
-# =====================================================
-include $(CLEAR_VARS)
-LOCAL_SRC_FILES:= $(commonSources)
-ifeq ($(HOST_OS), linux)
-LOCAL_SRC_FILES += Looper.cpp
-endif
-LOCAL_MODULE:= lib64utils
-LOCAL_STATIC_LIBRARIES := libz
-LOCAL_C_INCLUDES := \
-	external/zlib
-LOCAL_CFLAGS += $(host_commonCflags) -m64
-LOCAL_LDLIBS += $(host_commonLdlibs)
-include $(BUILD_HOST_STATIC_LIBRARY)
-
-
 # For the device
 # =====================================================
 include $(CLEAR_VARS)
@@ -114,6 +82,16 @@ LOCAL_C_INCLUDES += \
 		bionic/libc/private \
 		external/zlib
 
+LOCAL_C_INCLUDES += $(LOCAL_PATH)/../../include
+LOCAL_C_INCLUDES += $(LOCAL_PATH)/../../../../system/core/include
+LOCAL_C_INCLUDES += $(LOCAL_PATH)/../../../../frameworks/base/native/include
+
+LOCAL_CFLAGS += -DHAVE_ENDIAN_H -DHAVE_PTHREADS -DHAVE_SYS_UIO_H -DHAVE_POSIX_FILEMAP
+LOCAL_CFLAGS += -DHAVE_SCHED_H -DHAVE_SYS_UIO_H -DHAVE_IOCTL -DHAVE_TM_GMTOFF -DHAVE_OFF64_T
+LOCAL_CFLAGS += -DHAVE_EXPAT_CONFIG_H
+LOCAL_CFLAGS += -DOS_PATH_SEPARATOR=\'/\'
+
+
 LOCAL_LDLIBS += -lpthread
 
 LOCAL_SHARED_LIBRARIES := \
@@ -124,7 +102,7 @@ LOCAL_SHARED_LIBRARIES := \
 	libz
 
 LOCAL_MODULE:= libutils
-include $(BUILD_SHARED_LIBRARY)
+include $(BUILD_STATIC_LIBRARY)
 
 # Include subdirectory makefiles
 # ============================================================
