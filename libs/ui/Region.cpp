@@ -20,6 +20,7 @@
 
 #include <utils/Log.h>
 #include <utils/String8.h>
+#include <utils/CallStack.h>
 
 #include <ui/Rect.h>
 #include <ui/Region.h>
@@ -46,34 +47,158 @@ enum {
     op_xor  = region_operator<Rect>::op_xor
 };
 
+enum {
+    direction_LTR,
+    direction_RTL
+};
+
 // ----------------------------------------------------------------------------
 
-Region::Region()
-    : mBounds(0,0)
-{
+Region::Region() {
+    mStorage.add(Rect(0,0));
 }
 
 Region::Region(const Region& rhs)
-    : mBounds(rhs.mBounds), mStorage(rhs.mStorage)
+    : mStorage(rhs.mStorage)
 {
 #if VALIDATE_REGIONS
     validate(rhs, "rhs copy-ctor");
 #endif
 }
 
-Region::Region(const Rect& rhs)
-    : mBounds(rhs)
-{
-}
-
-Region::Region(const void* buffer)
-{
-    status_t err = read(buffer);
-    ALOGE_IF(err<0, "error %s reading Region from buffer", strerror(err));
+Region::Region(const Rect& rhs) {
+    mStorage.add(rhs);
 }
 
 Region::~Region()
 {
+}
+
+/**
+ * Copy rects from the src vector into the dst vector, resolving vertical T-Junctions along the way
+ *
+ * First pass through, divideSpanRTL will be set because the 'previous span' (indexing into the dst
+ * vector) will be reversed. Each rectangle in the original list, starting from the bottom, will be
+ * compared with the span directly below, and subdivided as needed to resolve T-junctions.
+ *
+ * The resulting temporary vector will be a completely reversed copy of the original, without any
+ * bottom-up T-junctions.
+ *
+ * Second pass through, divideSpanRTL will be false since the previous span will index into the
+ * final, correctly ordered region buffer. Each rectangle will be compared with the span directly
+ * above it, and subdivided to resolve any remaining T-junctions.
+ */
+static void reverseRectsResolvingJunctions(const Rect* begin, const Rect* end,
+        Vector<Rect>& dst, int spanDirection) {
+    dst.clear();
+
+    const Rect* current = end - 1;
+    int lastTop = current->top;
+
+    // add first span immediately
+    do {
+        dst.add(*current);
+        current--;
+    } while (current->top == lastTop && current >= begin);
+
+    unsigned int beginLastSpan = -1;
+    unsigned int endLastSpan = -1;
+    int top = -1;
+    int bottom = -1;
+
+    // for all other spans, split if a t-junction exists in the span directly above
+    while (current >= begin) {
+        if (current->top != (current + 1)->top) {
+            // new span
+            if ((spanDirection == direction_RTL && current->bottom != (current + 1)->top) ||
+                    (spanDirection == direction_LTR && current->top != (current + 1)->bottom)) {
+                // previous span not directly adjacent, don't check for T junctions
+                beginLastSpan = INT_MAX;
+            } else {
+                beginLastSpan = endLastSpan + 1;
+            }
+            endLastSpan = dst.size() - 1;
+
+            top = current->top;
+            bottom = current->bottom;
+        }
+        int left = current->left;
+        int right = current->right;
+
+        for (unsigned int prevIndex = beginLastSpan; prevIndex <= endLastSpan; prevIndex++) {
+            const Rect* prev = &dst[prevIndex];
+            if (spanDirection == direction_RTL) {
+                // iterating over previous span RTL, quit if it's too far left
+                if (prev->right <= left) break;
+
+                if (prev->right > left && prev->right < right) {
+                    dst.add(Rect(prev->right, top, right, bottom));
+                    right = prev->right;
+                }
+
+                if (prev->left > left && prev->left < right) {
+                    dst.add(Rect(prev->left, top, right, bottom));
+                    right = prev->left;
+                }
+
+                // if an entry in the previous span is too far right, nothing further left in the
+                // current span will need it
+                if (prev->left >= right) {
+                    beginLastSpan = prevIndex;
+                }
+            } else {
+                // iterating over previous span LTR, quit if it's too far right
+                if (prev->left >= right) break;
+
+                if (prev->left > left && prev->left < right) {
+                    dst.add(Rect(left, top, prev->left, bottom));
+                    left = prev->left;
+                }
+
+                if (prev->right > left && prev->right < right) {
+                    dst.add(Rect(left, top, prev->right, bottom));
+                    left = prev->right;
+                }
+                // if an entry in the previous span is too far left, nothing further right in the
+                // current span will need it
+                if (prev->right <= left) {
+                    beginLastSpan = prevIndex;
+                }
+            }
+        }
+
+        if (left < right) {
+            dst.add(Rect(left, top, right, bottom));
+        }
+
+        current--;
+    }
+}
+
+/**
+ * Creates a new region with the same data as the argument, but divides rectangles as necessary to
+ * remove T-Junctions
+ *
+ * Note: the output will not necessarily be a very efficient representation of the region, since it
+ * may be that a triangle-based approach would generate significantly simpler geometry
+ */
+Region Region::createTJunctionFreeRegion(const Region& r) {
+    if (r.isEmpty()) return r;
+    if (r.isRect()) return r;
+
+    Vector<Rect> reversed;
+    reverseRectsResolvingJunctions(r.begin(), r.end(), reversed, direction_RTL);
+
+    Region outputRegion;
+    reverseRectsResolvingJunctions(reversed.begin(), reversed.end(),
+            outputRegion.mStorage, direction_LTR);
+    outputRegion.mStorage.add(r.getBounds()); // to make region valid, mStorage must end with bounds
+
+#if VALIDATE_REGIONS
+    validate(outputRegion, "T-Junction free region");
+#endif
+
+    return outputRegion;
 }
 
 Region& Region::operator = (const Region& rhs)
@@ -82,43 +207,49 @@ Region& Region::operator = (const Region& rhs)
     validate(*this, "this->operator=");
     validate(rhs, "rhs.operator=");
 #endif
-    mBounds = rhs.mBounds;
     mStorage = rhs.mStorage;
     return *this;
 }
 
 Region& Region::makeBoundsSelf()
 {
-    mStorage.clear();
+    if (mStorage.size() >= 2) {
+        const Rect bounds(getBounds());
+        mStorage.clear();
+        mStorage.add(bounds);
+    }
     return *this;
 }
 
 void Region::clear()
 {
-    mBounds.clear();
     mStorage.clear();
+    mStorage.add(Rect(0,0));
 }
 
 void Region::set(const Rect& r)
 {
-    mBounds = r;
     mStorage.clear();
+    mStorage.add(r);
 }
 
 void Region::set(uint32_t w, uint32_t h)
 {
-    mBounds = Rect(int(w), int(h));
     mStorage.clear();
+    mStorage.add(Rect(w,h));
+}
+
+bool Region::isTriviallyEqual(const Region& region) const {
+    return begin() == region.begin();
 }
 
 // ----------------------------------------------------------------------------
 
 void Region::addRectUnchecked(int l, int t, int r, int b)
 {
-    mStorage.add(Rect(l,t,r,b));
-#if VALIDATE_REGIONS
-    validate(*this, "addRectUnchecked");
-#endif
+    Rect rect(l,t,r,b);
+    size_t where = mStorage.size() - 1;
+    mStorage.insertAt(rect, where, 1);
 }
 
 // ----------------------------------------------------------------------------
@@ -258,7 +389,7 @@ const Region Region::operation(const Region& rhs, int dx, int dy, int op) const 
 // to obtain an optimal region.
 class Region::rasterizer : public region_operator<Rect>::region_rasterizer 
 {
-    Rect& bounds;
+    Rect bounds;
     Vector<Rect>& storage;
     Rect* head;
     Rect* tail;
@@ -266,10 +397,7 @@ class Region::rasterizer : public region_operator<Rect>::region_rasterizer
     Rect* cur;
 public:
     rasterizer(Region& reg) 
-        : bounds(reg.mBounds), storage(reg.mStorage), head(), tail(), cur() {
-        bounds.top = bounds.bottom = 0;
-        bounds.left   = INT_MAX;
-        bounds.right  = INT_MIN;
+        : bounds(INT_MAX, 0, INT_MIN, 0), storage(reg.mStorage), head(), tail(), cur() {
         storage.clear();
     }
 
@@ -287,6 +415,7 @@ public:
             bounds.left  = 0;
             bounds.right = 0;
         }
+        storage.add(bounds);
     }
     
     virtual void operator()(const Rect& rect) {
@@ -342,44 +471,70 @@ private:
     }
 };
 
-bool Region::validate(const Region& reg, const char* name)
+bool Region::validate(const Region& reg, const char* name, bool silent)
 {
     bool result = true;
     const_iterator cur = reg.begin();
     const_iterator const tail = reg.end();
-    const_iterator prev = cur++;
+    const_iterator prev = cur;
     Rect b(*prev);
     while (cur != tail) {
-        b.left   = b.left   < cur->left   ? b.left   : cur->left;
-        b.top    = b.top    < cur->top    ? b.top    : cur->top;
-        b.right  = b.right  > cur->right  ? b.right  : cur->right;
-        b.bottom = b.bottom > cur->bottom ? b.bottom : cur->bottom;
-        if (cur->top == prev->top) {
-            if (cur->bottom != prev->bottom) {
-                ALOGE("%s: invalid span %p", name, cur);
+        if (cur->isValid() == false) {
+            ALOGE_IF(!silent, "%s: region contains an invalid Rect", name);
+            result = false;
+        }
+        if (cur->right > region_operator<Rect>::max_value) {
+            ALOGE_IF(!silent, "%s: rect->right > max_value", name);
+            result = false;
+        }
+        if (cur->bottom > region_operator<Rect>::max_value) {
+            ALOGE_IF(!silent, "%s: rect->right > max_value", name);
+            result = false;
+        }
+        if (prev != cur) {
+            b.left   = b.left   < cur->left   ? b.left   : cur->left;
+            b.top    = b.top    < cur->top    ? b.top    : cur->top;
+            b.right  = b.right  > cur->right  ? b.right  : cur->right;
+            b.bottom = b.bottom > cur->bottom ? b.bottom : cur->bottom;
+            if ((*prev < *cur) == false) {
+                ALOGE_IF(!silent, "%s: region's Rects not sorted", name);
                 result = false;
-            } else if (cur->left < prev->right) {
-                ALOGE("%s: spans overlap horizontally prev=%p, cur=%p",
+            }
+            if (cur->top == prev->top) {
+                if (cur->bottom != prev->bottom) {
+                    ALOGE_IF(!silent, "%s: invalid span %p", name, cur);
+                    result = false;
+                } else if (cur->left < prev->right) {
+                    ALOGE_IF(!silent,
+                            "%s: spans overlap horizontally prev=%p, cur=%p",
+                            name, prev, cur);
+                    result = false;
+                }
+            } else if (cur->top < prev->bottom) {
+                ALOGE_IF(!silent,
+                        "%s: spans overlap vertically prev=%p, cur=%p",
                         name, prev, cur);
                 result = false;
             }
-        } else if (cur->top < prev->bottom) {
-            ALOGE("%s: spans overlap vertically prev=%p, cur=%p",
-                    name, prev, cur);
-            result = false;
+            prev = cur;
         }
-        prev = cur;
         cur++;
     }
     if (b != reg.getBounds()) {
         result = false;
-        ALOGE("%s: invalid bounds [%d,%d,%d,%d] vs. [%d,%d,%d,%d]", name,
+        ALOGE_IF(!silent,
+                "%s: invalid bounds [%d,%d,%d,%d] vs. [%d,%d,%d,%d]", name,
                 b.left, b.top, b.right, b.bottom,
                 reg.getBounds().left, reg.getBounds().top, 
                 reg.getBounds().right, reg.getBounds().bottom);
     }
-    if (result == false) {
+    if (reg.mStorage.size() == 2) {
+        result = false;
+        ALOGE_IF(!silent, "%s: mStorage size is 2, which is never valid", name);
+    }
+    if (result == false && !silent) {
         reg.dump(name);
+        CallStack stack(LOG_TAG);
     }
     return result;
 }
@@ -535,11 +690,10 @@ void Region::boolean_operation(int op, Region& dst,
 
 void Region::translate(Region& reg, int dx, int dy)
 {
-    if (!reg.isEmpty()) {
+    if ((dx || dy) && !reg.isEmpty()) {
 #if VALIDATE_REGIONS
         validate(reg, "translate (before)");
 #endif
-        reg.mBounds.translate(dx, dy);
         size_t count = reg.mStorage.size();
         Rect* rects = reg.mStorage.editArray();
         while (count) {
@@ -561,73 +715,54 @@ void Region::translate(Region& dst, const Region& reg, int dx, int dy)
 
 // ----------------------------------------------------------------------------
 
-ssize_t Region::write(void* buffer, size_t size) const
-{
+size_t Region::getSize() const {
+    return mStorage.size() * sizeof(Rect);
+}
+
+status_t Region::flatten(void* buffer) const {
 #if VALIDATE_REGIONS
-    validate(*this, "write(buffer)");
+    validate(*this, "Region::flatten");
 #endif
-    const size_t count = mStorage.size();
-    const size_t sizeNeeded = sizeof(int32_t) + (1+count)*sizeof(Rect);
-    if (buffer != NULL) {
-        if (sizeNeeded > size) return NO_MEMORY;
-        int32_t* const p = static_cast<int32_t*>(buffer);
-        *p = count;
-        memcpy(p+1, &mBounds, sizeof(Rect));
-        if (count) {
-            memcpy(p+5, mStorage.array(), count*sizeof(Rect));
+    Rect* rects = reinterpret_cast<Rect*>(buffer);
+    memcpy(rects, mStorage.array(), mStorage.size() * sizeof(Rect));
+    return NO_ERROR;
+}
+
+status_t Region::unflatten(void const* buffer, size_t size) {
+    Region result;
+    if (size >= sizeof(Rect)) {
+        Rect const* rects = reinterpret_cast<Rect const*>(buffer);
+        size_t count = size / sizeof(Rect);
+        if (count > 0) {
+            result.mStorage.clear();
+            ssize_t err = result.mStorage.insertAt(0, count);
+            if (err < 0) {
+                return status_t(err);
+            }
+            memcpy(result.mStorage.editArray(), rects, count*sizeof(Rect));
         }
     }
-    return ssize_t(sizeNeeded);
-}
-
-ssize_t Region::read(const void* buffer)
-{
-    int32_t const* const p = static_cast<int32_t const*>(buffer); 
-    const size_t count = *p;
-    memcpy(&mBounds, p+1, sizeof(Rect));
-    mStorage.clear();
-    if (count) {
-        mStorage.insertAt(0, count);
-        memcpy(mStorage.editArray(), p+5, count*sizeof(Rect));
-    }
 #if VALIDATE_REGIONS
-    validate(*this, "read(buffer)");
+    validate(result, "Region::unflatten");
 #endif
-    return ssize_t(sizeof(int32_t) + (1+count)*sizeof(Rect));
-}
 
-ssize_t Region::writeEmpty(void* buffer, size_t size)
-{
-    const size_t sizeNeeded = sizeof(int32_t) + sizeof(Rect);
-    if (sizeNeeded > size) return NO_MEMORY;
-    int32_t* const p = static_cast<int32_t*>(buffer); 
-    memset(p, 0, sizeNeeded);
-    return ssize_t(sizeNeeded);
-}
-
-bool Region::isEmpty(void* buffer)
-{
-    int32_t const* const p = static_cast<int32_t const*>(buffer); 
-    Rect const* const b = reinterpret_cast<Rect const *>(p+1);
-    return b->isEmpty();
+    if (!result.validate(result, "Region::unflatten", true)) {
+        ALOGE("Region::unflatten() failed, invalid region");
+        return BAD_VALUE;
+    }
+    mStorage = result.mStorage;
+    return NO_ERROR;
 }
 
 // ----------------------------------------------------------------------------
 
 Region::const_iterator Region::begin() const {
-    return isRect() ? &mBounds : mStorage.array();
+    return mStorage.array();
 }
 
 Region::const_iterator Region::end() const {
-    if (isRect()) {
-        if (isEmpty()) {
-            return &mBounds;
-        } else {
-            return &mBounds + 1;
-        }
-    } else {
-        return mStorage.array() + mStorage.size();
-    }
+    size_t numRects = isRect() ? 1 : mStorage.size() - 1;
+    return mStorage.array() + numRects;
 }
 
 Rect const* Region::getArray(size_t* count) const {
@@ -637,14 +772,16 @@ Rect const* Region::getArray(size_t* count) const {
     return b;
 }
 
-size_t Region::getRects(Vector<Rect>& rectList) const
-{
-    rectList = mStorage;
-    if (rectList.isEmpty()) {
-        rectList.clear();
-        rectList.add(mBounds);
+SharedBuffer const* Region::getSharedBuffer(size_t* count) const {
+    // We can get to the SharedBuffer of a Vector<Rect> because Rect has
+    // a trivial destructor.
+    SharedBuffer const* sb = SharedBuffer::bufferFromData(mStorage.array());
+    if (count) {
+        size_t numRects = isRect() ? 1 : mStorage.size() - 1;
+        count[0] = numRects;
     }
-    return rectList.size();
+    sb->acquire();
+    return sb;
 }
 
 // ----------------------------------------------------------------------------

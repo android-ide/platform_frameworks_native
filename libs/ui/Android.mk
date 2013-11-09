@@ -16,18 +16,22 @@ LOCAL_PATH:= $(call my-dir)
 include $(CLEAR_VARS)
 
 LOCAL_SRC_FILES:= \
+	Fence.cpp \
 	FramebufferNativeWindow.cpp \
 	GraphicBuffer.cpp \
 	GraphicBufferAllocator.cpp \
 	GraphicBufferMapper.cpp \
 	PixelFormat.cpp \
 	Rect.cpp \
-	Region.cpp
+	Region.cpp \
+	UiConfig.cpp
 
 LOCAL_SHARED_LIBRARIES := \
 	libcutils \
+	libhardware \
+	libsync \
 	libutils \
-	libhardware
+	liblog
 
 ifneq ($(BOARD_FRAMEBUFFER_FORCE_FORMAT),)
 LOCAL_CFLAGS += -DFRAMEBUFFER_FORCE_FORMAT=$(BOARD_FRAMEBUFFER_FORCE_FORMAT)

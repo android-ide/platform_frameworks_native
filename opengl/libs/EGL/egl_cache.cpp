@@ -14,9 +14,10 @@
  ** limitations under the License.
  */
 
+#include "../egl_impl.h"
+
 #include "egl_cache.h"
 #include "egl_display.h"
-#include "egl_impl.h"
 #include "egldefs.h"
 
 #include <fcntl.h>
@@ -29,12 +30,16 @@
 #define MAX_EGL_CACHE_ENTRY_SIZE (16 * 1024);
 #endif
 
+#ifndef MAX_EGL_CACHE_KEY_SIZE
+#define MAX_EGL_CACHE_KEY_SIZE (1024);
+#endif
+
 #ifndef MAX_EGL_CACHE_SIZE
 #define MAX_EGL_CACHE_SIZE (64 * 1024);
 #endif
 
 // Cache size limits.
-static const size_t maxKeySize = 1024;
+static const size_t maxKeySize = MAX_EGL_CACHE_KEY_SIZE;
 static const size_t maxValueSize = MAX_EGL_CACHE_ENTRY_SIZE;
 static const size_t maxTotalSize = MAX_EGL_CACHE_SIZE;
 

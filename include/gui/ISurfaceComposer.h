@@ -34,70 +34,28 @@ namespace android {
 // ----------------------------------------------------------------------------
 
 class ComposerState;
+class DisplayState;
+class DisplayInfo;
 class IDisplayEventConnection;
 class IMemoryHeap;
 
-class ISurfaceComposer : public IInterface
-{
+/*
+ * This class defines the Binder IPC interface for accessing various
+ * SurfaceFlinger features.
+ */
+class ISurfaceComposer: public IInterface {
 public:
     DECLARE_META_INTERFACE(SurfaceComposer);
 
-    enum { // (keep in sync with Surface.java)
-        eHidden             = 0x00000004,
-        eDestroyBackbuffer  = 0x00000020,
-        eSecure             = 0x00000080,
-        eNonPremultiplied   = 0x00000100,
-        eOpaque             = 0x00000400,
-        eProtectedByApp     = 0x00000800,
-        eProtectedByDRM     = 0x00001000,
-
-        eFXSurfaceNormal    = 0x00000000,
-        eFXSurfaceBlur      = 0x00010000,
-        eFXSurfaceDim       = 0x00020000,
-        eFXSurfaceScreenshot= 0x00030000,
-        eFXSurfaceMask      = 0x000F0000,
+    // flags for setTransactionState()
+    enum {
+        eSynchronous = 0x01,
+        eAnimation   = 0x02,
     };
 
     enum {
-        ePositionChanged            = 0x00000001,
-        eLayerChanged               = 0x00000002,
-        eSizeChanged                = 0x00000004,
-        eAlphaChanged               = 0x00000008,
-        eMatrixChanged              = 0x00000010,
-        eTransparentRegionChanged   = 0x00000020,
-        eVisibilityChanged          = 0x00000040,
-        eFreezeTintChanged          = 0x00000080,
-        eCropChanged                = 0x00000100,
-    };
-
-    enum {
-        eLayerHidden        = 0x01,
-        eLayerFrozen        = 0x02,
-        eLayerDither        = 0x04,
-        eLayerFilter        = 0x08,
-        eLayerBlurFreeze    = 0x10
-    };
-
-    enum {
-        eOrientationDefault     = 0,
-        eOrientation90          = 1,
-        eOrientation180         = 2,
-        eOrientation270         = 3,
-        eOrientationUnchanged   = 4,
-        eOrientationSwapMask    = 0x01
-    };
-
-    enum {
-        eSynchronous            = 0x01,
-    };
-
-    enum {
-        eElectronBeamAnimationOn  = 0x01,
-        eElectronBeamAnimationOff = 0x10
-    };
-
-    enum {
-        eDisplayIdMain = 0
+        eDisplayIdMain = 0,
+        eDisplayIdHdmi = 1
     };
 
     /* create connection with surface flinger, requires
@@ -109,46 +67,61 @@ public:
      */
     virtual sp<IGraphicBufferAlloc> createGraphicBufferAlloc() = 0;
 
-    /* retrieve the control block */
-    virtual sp<IMemoryHeap> getCblk() const = 0;
+    /* return an IDisplayEventConnection */
+    virtual sp<IDisplayEventConnection> createDisplayEventConnection() = 0;
+
+    /* create a display
+     * requires ACCESS_SURFACE_FLINGER permission.
+     */
+    virtual sp<IBinder> createDisplay(const String8& displayName,
+            bool secure) = 0;
+
+    /* get the token for the existing default displays. possible values
+     * for id are eDisplayIdMain and eDisplayIdHdmi.
+     */
+    virtual sp<IBinder> getBuiltInDisplay(int32_t id) = 0;
 
     /* open/close transactions. requires ACCESS_SURFACE_FLINGER permission */
     virtual void setTransactionState(const Vector<ComposerState>& state,
-            int orientation, uint32_t flags) = 0;
+            const Vector<DisplayState>& displays, uint32_t flags) = 0;
 
     /* signal that we're done booting.
      * Requires ACCESS_SURFACE_FLINGER permission
      */
     virtual void bootFinished() = 0;
 
+    /* verify that an IGraphicBufferProducer was created by SurfaceFlinger.
+     */
+    virtual bool authenticateSurfaceTexture(
+            const sp<IGraphicBufferProducer>& surface) const = 0;
+
+    /* triggers screen off and waits for it to complete
+     * requires ACCESS_SURFACE_FLINGER permission.
+     */
+    virtual void blank(const sp<IBinder>& display) = 0;
+
+    /* triggers screen on and waits for it to complete
+     * requires ACCESS_SURFACE_FLINGER permission.
+     */
+    virtual void unblank(const sp<IBinder>& display) = 0;
+
+    /* returns information about a display
+     * intended to be used to get information about built-in displays */
+    virtual status_t getDisplayInfo(const sp<IBinder>& display, DisplayInfo* info) = 0;
+
     /* Capture the specified screen. requires READ_FRAME_BUFFER permission
      * This function will fail if there is a secure window on screen.
      */
-    virtual status_t captureScreen(DisplayID dpy,
-            sp<IMemoryHeap>* heap,
-            uint32_t* width, uint32_t* height, PixelFormat* format,
+    virtual status_t captureScreen(const sp<IBinder>& display,
+            const sp<IGraphicBufferProducer>& producer,
             uint32_t reqWidth, uint32_t reqHeight,
-            uint32_t minLayerZ, uint32_t maxLayerZ) = 0;
-
-    /* triggers screen off animation */
-    virtual status_t turnElectronBeamOff(int32_t mode) = 0;
-
-    /* triggers screen on animation */
-    virtual status_t turnElectronBeamOn(int32_t mode) = 0;
-
-    /* verify that an ISurfaceTexture was created by SurfaceFlinger.
-     */
-    virtual bool authenticateSurfaceTexture(
-            const sp<ISurfaceTexture>& surface) const = 0;
-
-    /* return an IDisplayEventConnection */
-    virtual sp<IDisplayEventConnection> createDisplayEventConnection() = 0;
+            uint32_t minLayerZ, uint32_t maxLayerZ,
+            bool isCpuConsumer) = 0;
 };
 
 // ----------------------------------------------------------------------------
 
-class BnSurfaceComposer : public BnInterface<ISurfaceComposer>
-{
+class BnSurfaceComposer: public BnInterface<ISurfaceComposer> {
 public:
     enum {
         // Note: BOOT_FINISHED must remain this value, it is called from
@@ -156,20 +129,20 @@ public:
         BOOT_FINISHED = IBinder::FIRST_CALL_TRANSACTION,
         CREATE_CONNECTION,
         CREATE_GRAPHIC_BUFFER_ALLOC,
-        GET_CBLK,
-        SET_TRANSACTION_STATE,
-        SET_ORIENTATION,
-        CAPTURE_SCREEN,
-        TURN_ELECTRON_BEAM_OFF,
-        TURN_ELECTRON_BEAM_ON,
-        AUTHENTICATE_SURFACE,
         CREATE_DISPLAY_EVENT_CONNECTION,
+        CREATE_DISPLAY,
+        GET_BUILT_IN_DISPLAY,
+        SET_TRANSACTION_STATE,
+        AUTHENTICATE_SURFACE,
+        BLANK,
+        UNBLANK,
+        GET_DISPLAY_INFO,
+        CONNECT_DISPLAY,
+        CAPTURE_SCREEN,
     };
 
-    virtual status_t    onTransact( uint32_t code,
-                                    const Parcel& data,
-                                    Parcel* reply,
-                                    uint32_t flags = 0);
+    virtual status_t onTransact(uint32_t code, const Parcel& data,
+            Parcel* reply, uint32_t flags = 0);
 };
 
 // ----------------------------------------------------------------------------

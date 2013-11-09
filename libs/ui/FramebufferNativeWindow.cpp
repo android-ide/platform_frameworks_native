@@ -28,6 +28,7 @@
 #include <utils/RefBase.h>
 
 #include <ui/ANativeObjectBase.h>
+#include <ui/Fence.h>
 #include <ui/FramebufferNativeWindow.h>
 #include <ui/Rect.h>
 
@@ -92,8 +93,13 @@ FramebufferNativeWindow::FramebufferNativeWindow()
         mUpdateOnDemand = (fbDev->setUpdateRect != 0);
         
         // initialize the buffer FIFO
-        mNumBuffers = NUM_FRAME_BUFFERS;
-        mNumFreeBuffers = NUM_FRAME_BUFFERS;
+        if(fbDev->numFramebuffers >= MIN_NUM_FRAME_BUFFERS &&
+           fbDev->numFramebuffers <= MAX_NUM_FRAME_BUFFERS){
+            mNumBuffers = fbDev->numFramebuffers;
+        } else {
+            mNumBuffers = MIN_NUM_FRAME_BUFFERS;
+        }
+        mNumFreeBuffers = mNumBuffers;
         mBufferHead = mNumBuffers-1;
 
         /*
@@ -145,19 +151,23 @@ FramebufferNativeWindow::FramebufferNativeWindow()
 
     ANativeWindow::setSwapInterval = setSwapInterval;
     ANativeWindow::dequeueBuffer = dequeueBuffer;
-    ANativeWindow::lockBuffer = lockBuffer;
     ANativeWindow::queueBuffer = queueBuffer;
     ANativeWindow::query = query;
     ANativeWindow::perform = perform;
+
+    ANativeWindow::dequeueBuffer_DEPRECATED = dequeueBuffer_DEPRECATED;
+    ANativeWindow::lockBuffer_DEPRECATED = lockBuffer_DEPRECATED;
+    ANativeWindow::queueBuffer_DEPRECATED = queueBuffer_DEPRECATED;
 }
 
 FramebufferNativeWindow::~FramebufferNativeWindow() 
 {
     if (grDev) {
-        if (buffers[0] != NULL)
-            grDev->free(grDev, buffers[0]->handle);
-        if (buffers[1] != NULL)
-            grDev->free(grDev, buffers[1]->handle);
+        for(int i = 0; i < mNumBuffers; i++) {
+            if (buffers[i] != NULL) {
+                grDev->free(grDev, buffers[i]->handle);
+            }
+        }
         gralloc_close(grDev);
     }
 
@@ -207,8 +217,23 @@ int FramebufferNativeWindow::getCurrentBufferIndex() const
     return index;
 }
 
-int FramebufferNativeWindow::dequeueBuffer(ANativeWindow* window, 
+int FramebufferNativeWindow::dequeueBuffer_DEPRECATED(ANativeWindow* window, 
         ANativeWindowBuffer** buffer)
+{
+    int fenceFd = -1;
+    int result = dequeueBuffer(window, buffer, &fenceFd);
+    sp<Fence> fence(new Fence(fenceFd));
+    int waitResult = fence->wait(Fence::TIMEOUT_NEVER);
+    if (waitResult != OK) {
+        ALOGE("dequeueBuffer_DEPRECATED: Fence::wait returned an "
+                "error: %d", waitResult);
+        return waitResult;
+    }
+    return result;
+}
+
+int FramebufferNativeWindow::dequeueBuffer(ANativeWindow* window, 
+        ANativeWindowBuffer** buffer, int* fenceFd)
 {
     FramebufferNativeWindow* self = getSelf(window);
     Mutex::Autolock _l(self->mutex);
@@ -218,42 +243,44 @@ int FramebufferNativeWindow::dequeueBuffer(ANativeWindow* window,
     if (self->mBufferHead >= self->mNumBuffers)
         self->mBufferHead = 0;
 
-    // wait for a free buffer
-    while (!self->mNumFreeBuffers) {
+    // wait for a free non-front buffer
+    while (self->mNumFreeBuffers < 2) {
         self->mCondition.wait(self->mutex);
     }
+    ALOG_ASSERT(self->buffers[index] != self->front);
+
     // get this buffer
     self->mNumFreeBuffers--;
     self->mCurrentBufferIndex = index;
 
     *buffer = self->buffers[index].get();
+    *fenceFd = -1;
 
     return 0;
 }
 
-int FramebufferNativeWindow::lockBuffer(ANativeWindow* window, 
+int FramebufferNativeWindow::lockBuffer_DEPRECATED(ANativeWindow* window, 
         ANativeWindowBuffer* buffer)
 {
-    FramebufferNativeWindow* self = getSelf(window);
-    Mutex::Autolock _l(self->mutex);
-
-    const int index = self->mCurrentBufferIndex;
-
-    // wait that the buffer we're locking is not front anymore
-    while (self->front == buffer) {
-        self->mCondition.wait(self->mutex);
-    }
-
     return NO_ERROR;
 }
 
-int FramebufferNativeWindow::queueBuffer(ANativeWindow* window, 
+int FramebufferNativeWindow::queueBuffer_DEPRECATED(ANativeWindow* window, 
         ANativeWindowBuffer* buffer)
+{
+    return queueBuffer(window, buffer, -1);
+}
+
+int FramebufferNativeWindow::queueBuffer(ANativeWindow* window, 
+        ANativeWindowBuffer* buffer, int fenceFd)
 {
     FramebufferNativeWindow* self = getSelf(window);
     Mutex::Autolock _l(self->mutex);
     framebuffer_device_t* fb = self->fbDev;
     buffer_handle_t handle = static_cast<NativeBuffer*>(buffer)->handle;
+
+    sp<Fence> fence(new Fence(fenceFd));
+    fence->wait(Fence::TIMEOUT_NEVER);
 
     const int index = self->mCurrentBufferIndex;
     int res = fb->post(fb, handle);

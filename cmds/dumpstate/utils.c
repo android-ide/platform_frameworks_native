@@ -31,23 +31,27 @@
 #include <sys/klog.h>
 #include <time.h>
 #include <unistd.h>
+#include <sys/prctl.h>
 
 #include <cutils/debugger.h>
 #include <cutils/properties.h>
 #include <cutils/sockets.h>
 #include <private/android_filesystem_config.h>
 
+#include <selinux/android.h>
+
 #include "dumpstate.h"
 
 /* list of native processes to include in the native dumps */
 static const char* native_processes_to_dump[] = {
+        "/system/bin/drmserver",
         "/system/bin/mediaserver",
         "/system/bin/sdcard",
         "/system/bin/surfaceflinger",
         NULL,
 };
 
-void for_each_pid(void (*func)(int, const char *), const char *header) {
+static void __for_each_pid(void (*helper)(int, const char *, void *), const char *header, void *arg) {
     DIR *d;
     struct dirent *de;
 
@@ -72,23 +76,85 @@ void for_each_pid(void (*func)(int, const char *), const char *header) {
         if ((fd = open(cmdpath, O_RDONLY)) < 0) {
             strcpy(cmdline, "N/A");
         } else {
-            read(fd, cmdline, sizeof(cmdline));
+            read(fd, cmdline, sizeof(cmdline) - 1);
             close(fd);
         }
-        func(pid, cmdline);
+        helper(pid, cmdline, arg);
     }
 
     closedir(d);
 }
 
-void show_wchan(int pid, const char *name) {
+static void for_each_pid_helper(int pid, const char *cmdline, void *arg) {
+    for_each_pid_func *func = arg;
+    func(pid, cmdline);
+}
+
+void for_each_pid(for_each_pid_func func, const char *header) {
+    __for_each_pid(for_each_pid_helper, header, func);
+}
+
+static void for_each_tid_helper(int pid, const char *cmdline, void *arg) {
+    DIR *d;
+    struct dirent *de;
+    char taskpath[255];
+    for_each_tid_func *func = arg;
+
+    sprintf(taskpath, "/proc/%d/task", pid);
+
+    if (!(d = opendir(taskpath))) {
+        printf("Failed to open %s (%s)\n", taskpath, strerror(errno));
+        return;
+    }
+
+    func(pid, pid, cmdline);
+
+    while ((de = readdir(d))) {
+        int tid;
+        int fd;
+        char commpath[255];
+        char comm[255];
+
+        if (!(tid = atoi(de->d_name))) {
+            continue;
+        }
+
+        if (tid == pid)
+            continue;
+
+        sprintf(commpath,"/proc/%d/comm", tid);
+        memset(comm, 0, sizeof(comm));
+        if ((fd = open(commpath, O_RDONLY)) < 0) {
+            strcpy(comm, "N/A");
+        } else {
+            char *c;
+            read(fd, comm, sizeof(comm) - 1);
+            close(fd);
+
+            c = strrchr(comm, '\n');
+            if (c) {
+                *c = '\0';
+            }
+        }
+        func(pid, tid, comm);
+    }
+
+    closedir(d);
+}
+
+void for_each_tid(for_each_tid_func func, const char *header) {
+    __for_each_pid(for_each_tid_helper, header, func);
+}
+
+void show_wchan(int pid, int tid, const char *name) {
     char path[255];
     char buffer[255];
     int fd;
+    char name_buffer[255];
 
     memset(buffer, 0, sizeof(buffer));
 
-    sprintf(path, "/proc/%d/wchan", pid);
+    sprintf(path, "/proc/%d/wchan", tid);
     if ((fd = open(path, O_RDONLY)) < 0) {
         printf("Failed to open '%s' (%s)\n", path, strerror(errno));
         return;
@@ -99,7 +165,10 @@ void show_wchan(int pid, const char *name) {
         goto out_close;
     }
 
-    printf("%-7d %-32s %s\n", pid, name, buffer);
+    snprintf(name_buffer, sizeof(name_buffer), "%*s%s",
+             pid == tid ? 0 : 3, "", name);
+
+    printf("%-7d %-32s %s\n", tid, name_buffer, buffer);
 
 out_close:
     close(fd);
@@ -108,7 +177,8 @@ out_close:
 
 void do_dmesg() {
     printf("------ KERNEL LOG (dmesg) ------\n");
-    int size = klogctl(10, NULL, 0); /* Get size of kernel buffer */
+    /* Get size of kernel buffer */
+    int size = klogctl(KLOG_SIZE_BUFFER, NULL, 0);
     if (size <= 0) {
         printf("Unexpected klogctl return value: %d\n\n", size);
         return;
@@ -196,6 +266,9 @@ int run_command(const char *title, int timeout_seconds, const char *command, ...
     if (pid == 0) {
         const char *args[1024] = {command};
         size_t arg;
+
+        /* make sure the child dies when dumpstate dies */
+        prctl(PR_SET_PDEATHSIG, SIGKILL);
 
         va_list ap;
         va_start(ap, command);
@@ -308,7 +381,7 @@ pid_t redirect_to_file(FILE *redirect, char *path, int gzip_level) {
         chp = strchr(chp, '/');
         if (chp) {
             *chp = 0;
-            mkdir(path, 0775);  /* drwxrwxr-x */
+            mkdir(path, 0770);  /* drwxrwx--- */
             *chp++ = '/';
         }
     }
@@ -396,6 +469,9 @@ const char *dump_traces() {
         if (!mkdir(anr_traces_dir, 0775)) {
             chown(anr_traces_dir, AID_SYSTEM, AID_SYSTEM);
             chmod(anr_traces_dir, 0775);
+            if (selinux_android_restorecon(anr_traces_dir) == -1) {
+                fprintf(stderr, "restorecon failed for %s: %s\n", anr_traces_dir, strerror(errno));
+            }
         } else if (errno != EEXIST) {
             fprintf(stderr, "mkdir(%s): %s\n", anr_traces_dir, strerror(errno));
             return NULL;

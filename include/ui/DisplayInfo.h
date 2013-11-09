@@ -14,7 +14,6 @@
  * limitations under the License.
  */
 
-
 #ifndef ANDROID_UI_DISPLAY_INFO_H
 #define ANDROID_UI_DISPLAY_INFO_H
 
@@ -26,15 +25,17 @@
 namespace android {
 
 struct DisplayInfo {
-    uint32_t            w;
-    uint32_t            h;
-    PixelFormatInfo     pixelFormatInfo;
-    uint8_t             orientation;
-    uint8_t             reserved[3];
-    float               fps;
-    float               density;
-    float               xdpi;
-    float               ydpi;
+    uint32_t w;
+    uint32_t h;
+    float xdpi;
+    float ydpi;
+    float fps;
+    float density;
+    uint8_t orientation;
+    bool secure;
+    uint8_t reserved[2];
+    // TODO: this needs to go away (currently needed only by webkit)
+    PixelFormatInfo pixelFormatInfo;
 };
 
 /* Display orientations as defined in Surface.java and ISurfaceComposer.h. */
@@ -45,8 +46,6 @@ enum {
     DISPLAY_ORIENTATION_270 = 3
 };
 
-
 }; // namespace android
 
 #endif // ANDROID_COMPOSER_DISPLAY_INFO_H
-

@@ -31,6 +31,7 @@
 
 #include <utils/threads.h>
 #include <ui/ANativeObjectBase.h>
+#include <ui/Fence.h>
 
 #include <EGL/egl.h>
 #include <EGL/eglext.h>
@@ -146,6 +147,7 @@ struct egl_surface_t
     EGLDisplay          dpy;
     EGLConfig           config;
     EGLContext          ctx;
+    bool                zombie;
 
                 egl_surface_t(EGLDisplay dpy, EGLConfig config, int32_t depthFormat);
     virtual     ~egl_surface_t();
@@ -165,7 +167,6 @@ struct egl_surface_t
     virtual     EGLint      getSwapBehavior() const;
     virtual     EGLBoolean  swapBuffers();
     virtual     EGLBoolean  setSwapRectangle(EGLint l, EGLint t, EGLint w, EGLint h);
-    virtual     EGLClientBuffer getRenderBuffer() const;
 protected:
     GGLSurface              depth;
 };
@@ -173,7 +174,7 @@ protected:
 egl_surface_t::egl_surface_t(EGLDisplay dpy,
         EGLConfig config,
         int32_t depthFormat)
-    : magic(MAGIC), dpy(dpy), config(config), ctx(0)
+    : magic(MAGIC), dpy(dpy), config(config), ctx(0), zombie(false)
 {
     depth.version = sizeof(GGLSurface);
     depth.data = 0;
@@ -209,9 +210,6 @@ EGLBoolean egl_surface_t::setSwapRectangle(
 {
     return EGL_FALSE;
 }
-EGLClientBuffer egl_surface_t::getRenderBuffer() const {
-    return 0;
-}
 
 // ----------------------------------------------------------------------------
 
@@ -237,7 +235,6 @@ struct egl_window_surface_v2_t : public egl_surface_t
     virtual     EGLint      getRefreshRate() const;
     virtual     EGLint      getSwapBehavior() const;
     virtual     EGLBoolean  setSwapRectangle(EGLint l, EGLint t, EGLint w, EGLint h);
-    virtual     EGLClientBuffer  getRenderBuffer() const;
     
 private:
     status_t lock(ANativeWindowBuffer* buf, int usage, void** vaddr);
@@ -377,7 +374,16 @@ EGLBoolean egl_window_surface_v2_t::connect()
             GRALLOC_USAGE_SW_READ_OFTEN | GRALLOC_USAGE_SW_WRITE_OFTEN);
 
     // dequeue a buffer
-    if (nativeWindow->dequeueBuffer(nativeWindow, &buffer) != NO_ERROR) {
+    int fenceFd = -1;
+    if (nativeWindow->dequeueBuffer(nativeWindow, &buffer,
+            &fenceFd) != NO_ERROR) {
+        return setError(EGL_BAD_ALLOC, EGL_FALSE);
+    }
+
+    // wait for the buffer
+    sp<Fence> fence(new Fence(fenceFd));
+    if (fence->wait(Fence::TIMEOUT_NEVER) != NO_ERROR) {
+        nativeWindow->cancelBuffer(nativeWindow, buffer, fenceFd);
         return setError(EGL_BAD_ALLOC, EGL_FALSE);
     }
 
@@ -397,8 +403,6 @@ EGLBoolean egl_window_surface_v2_t::connect()
     // keep a reference on the buffer
     buffer->common.incRef(&buffer->common);
 
-    // Lock the buffer
-    nativeWindow->lockBuffer(nativeWindow, buffer);
     // pin the buffer down
     if (lock(buffer, GRALLOC_USAGE_SW_READ_OFTEN | 
             GRALLOC_USAGE_SW_WRITE_OFTEN, &bits) != NO_ERROR) {
@@ -416,9 +420,8 @@ void egl_window_surface_v2_t::disconnect()
         bits = NULL;
         unlock(buffer);
     }
-    // enqueue the last frame
-    nativeWindow->queueBuffer(nativeWindow, buffer);
     if (buffer) {
+        nativeWindow->cancelBuffer(nativeWindow, buffer, -1);
         buffer->common.decRef(&buffer->common);
         buffer = 0;
     }
@@ -522,15 +525,17 @@ EGLBoolean egl_window_surface_v2_t::swapBuffers()
     
     unlock(buffer);
     previousBuffer = buffer;
-    nativeWindow->queueBuffer(nativeWindow, buffer);
+    nativeWindow->queueBuffer(nativeWindow, buffer, -1);
     buffer = 0;
 
     // dequeue a new buffer
-    if (nativeWindow->dequeueBuffer(nativeWindow, &buffer) == NO_ERROR) {
-
-        // TODO: lockBuffer should rather be executed when the very first
-        // direct rendering occurs.
-        nativeWindow->lockBuffer(nativeWindow, buffer);
+    int fenceFd = -1;
+    if (nativeWindow->dequeueBuffer(nativeWindow, &buffer, &fenceFd) == NO_ERROR) {
+        sp<Fence> fence(new Fence(fenceFd));
+        if (fence->wait(Fence::TIMEOUT_NEVER)) {
+            nativeWindow->cancelBuffer(nativeWindow, buffer, fenceFd);
+            return setError(EGL_BAD_ALLOC, EGL_FALSE);
+        }
 
         // reallocate the depth-buffer if needed
         if ((width != buffer->width) || (height != buffer->height)) {
@@ -574,11 +579,6 @@ EGLBoolean egl_window_surface_v2_t::setSwapRectangle(
 {
     dirtyRegion = Rect(l, t, l+w, t+h);
     return EGL_TRUE;
-}
-
-EGLClientBuffer egl_window_surface_v2_t::getRenderBuffer() const
-{
-    return buffer;
 }
 
 EGLBoolean egl_window_surface_v2_t::bindDrawSurface(ogles_context_t* gl)
@@ -811,7 +811,6 @@ static char const * const gExtensionsString =
         // "KHR_image_pixmap "
         "EGL_ANDROID_image_native_buffer "
         "EGL_ANDROID_swap_rectangle "
-        "EGL_ANDROID_get_render_buffer "
         ;
 
 // ----------------------------------------------------------------------------
@@ -872,8 +871,6 @@ static const extention_map_t gExtentionMap[] = {
             (__eglMustCastToProperFunctionPointerType)&eglGetSyncAttribKHR },
     { "eglSetSwapRectangleANDROID", 
             (__eglMustCastToProperFunctionPointerType)&eglSetSwapRectangleANDROID }, 
-    { "eglGetRenderBufferANDROID",
-        (__eglMustCastToProperFunctionPointerType)&eglGetRenderBufferANDROID },
 };
 
 /*
@@ -1583,11 +1580,12 @@ EGLBoolean eglDestroySurface(EGLDisplay dpy, EGLSurface eglSurface)
         if (surface->dpy != dpy)
             return setError(EGL_BAD_DISPLAY, EGL_FALSE);
         if (surface->ctx) {
-            // FIXME: this surface is current check what the spec says
+            // defer disconnect/delete until no longer current
+            surface->zombie = true;
+        } else {
             surface->disconnect();
-            surface->ctx = 0;
+            delete surface;
         }
-        delete surface;
     }
     return EGL_TRUE;
 }
@@ -1739,6 +1737,9 @@ EGLBoolean eglMakeCurrent(  EGLDisplay dpy, EGLSurface draw,
             if (c->draw) {
                 egl_surface_t* s = reinterpret_cast<egl_surface_t*>(c->draw);
                 s->disconnect();
+                s->ctx = EGL_NO_CONTEXT;
+                if (s->zombie)
+                    delete s;
             }
             if (c->read) {
                 // FIXME: unlock/disconnect the read surface too 
@@ -1780,8 +1781,10 @@ EGLBoolean eglMakeCurrent(  EGLDisplay dpy, EGLSurface draw,
                 egl_surface_t* r = (egl_surface_t*)c->read;
                 if (d) {
                     c->draw = 0;
-                    d->ctx = EGL_NO_CONTEXT;
                     d->disconnect();
+                    d->ctx = EGL_NO_CONTEXT;
+                    if (d->zombie)
+                        delete d;
                 }
                 if (r) {
                     c->read = 0;
@@ -2166,19 +2169,4 @@ EGLBoolean eglSetSwapRectangleANDROID(EGLDisplay dpy, EGLSurface draw,
     d->setSwapRectangle(left, top, width, height);
 
     return EGL_TRUE;
-}
-
-EGLClientBuffer eglGetRenderBufferANDROID(EGLDisplay dpy, EGLSurface draw)
-{
-    if (egl_display_t::is_valid(dpy) == EGL_FALSE)
-        return setError(EGL_BAD_DISPLAY, (EGLClientBuffer)0);
-
-    egl_surface_t* d = static_cast<egl_surface_t*>(draw);
-    if (!d->isValid())
-        return setError(EGL_BAD_SURFACE, (EGLClientBuffer)0);
-    if (d->dpy != dpy)
-        return setError(EGL_BAD_DISPLAY, (EGLClientBuffer)0);
-
-    // post the surface
-    return d->getRenderBuffer();
 }

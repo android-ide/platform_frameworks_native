@@ -2,22 +2,26 @@
 LOCAL_PATH:= $(call my-dir)
 include $(CLEAR_VARS)
 
-LOCAL_MODULE := SurfaceTexture_test
+LOCAL_MODULE := libgui_test
 
 LOCAL_MODULE_TAGS := tests
 
 LOCAL_SRC_FILES := \
-    Surface_test.cpp \
+    BufferQueue_test.cpp \
+    CpuConsumer_test.cpp \
     SurfaceTextureClient_test.cpp \
     SurfaceTexture_test.cpp \
+    Surface_test.cpp \
 
 LOCAL_SHARED_LIBRARIES := \
 	libEGL \
+	libGLESv1_CM \
 	libGLESv2 \
 	libbinder \
 	libcutils \
 	libgui \
 	libstlport \
+	libsync \
 	libui \
 	libutils \
 

@@ -15,6 +15,7 @@
  */
 
 #define LOG_TAG "RefBase"
+// #define LOG_NDEBUG 0
 
 #include <utils/RefBase.h>
 
@@ -34,9 +35,17 @@
 
 // compile with refcounting debugging enabled
 #define DEBUG_REFS                      0
-#define DEBUG_REFS_FATAL_SANITY_CHECKS  0
-#define DEBUG_REFS_ENABLED_BY_DEFAULT   1
+
+// whether ref-tracking is enabled by default, if not, trackMe(true, false)
+// needs to be called explicitly
+#define DEBUG_REFS_ENABLED_BY_DEFAULT   0
+
+// whether callstack are collected (significantly slows things down)
 #define DEBUG_REFS_CALLSTACK_ENABLED    1
+
+// folder where stack traces are saved when DEBUG_REFS is enabled
+// this folder needs to exist and be writable
+#define DEBUG_REFS_CALLSTACK_PATH       "/data/debug"
 
 // log all reference counting operations
 #define PRINT_REFS                      0
@@ -95,17 +104,13 @@ public:
         bool dumpStack = false;
         if (!mRetain && mStrongRefs != NULL) {
             dumpStack = true;
-#if DEBUG_REFS_FATAL_SANITY_CHECKS
-            LOG_ALWAYS_FATAL("Strong references remain!");
-#else
             ALOGE("Strong references remain:");
-#endif
             ref_entry* refs = mStrongRefs;
             while (refs) {
                 char inc = refs->ref >= 0 ? '+' : '-';
                 ALOGD("\t%c ID %p (ref %d):", inc, refs->id, refs->ref);
 #if DEBUG_REFS_CALLSTACK_ENABLED
-                refs->stack.dump();
+                refs->stack.dump(LOG_TAG);
 #endif
                 refs = refs->next;
             }
@@ -113,26 +118,20 @@ public:
 
         if (!mRetain && mWeakRefs != NULL) {
             dumpStack = true;
-#if DEBUG_REFS_FATAL_SANITY_CHECKS
-            LOG_ALWAYS_FATAL("Weak references remain:");
-#else
             ALOGE("Weak references remain!");
-#endif
             ref_entry* refs = mWeakRefs;
             while (refs) {
                 char inc = refs->ref >= 0 ? '+' : '-';
                 ALOGD("\t%c ID %p (ref %d):", inc, refs->id, refs->ref);
 #if DEBUG_REFS_CALLSTACK_ENABLED
-                refs->stack.dump();
+                refs->stack.dump(LOG_TAG);
 #endif
                 refs = refs->next;
             }
         }
         if (dumpStack) {
             ALOGE("above errors at:");
-            CallStack stack;
-            stack.update();
-            stack.dump();
+            CallStack stack(LOG_TAG);
         }
     }
 
@@ -198,8 +197,8 @@ public:
 
         {
             char name[100];
-            snprintf(name, 100, "/data/%p.stack", this);
-            int rc = open(name, O_RDWR | O_CREAT | O_APPEND);
+            snprintf(name, 100, DEBUG_REFS_CALLSTACK_PATH "/%p.stack", this);
+            int rc = open(name, O_RDWR | O_CREAT | O_APPEND, 644);
             if (rc >= 0) {
                 write(rc, text.string(), text.length());
                 close(rc);
@@ -257,12 +256,6 @@ private:
                 ref = *refs;
             }
 
-#if DEBUG_REFS_FATAL_SANITY_CHECKS
-            LOG_ALWAYS_FATAL("RefBase: removing id %p on RefBase %p"
-                    "(weakref_type %p) that doesn't exist!",
-                    id, mBase, this);
-#endif
-
             ALOGE("RefBase: removing id %p on RefBase %p"
                     "(weakref_type %p) that doesn't exist!",
                     id, mBase, this);
@@ -274,9 +267,7 @@ private:
                 ref = ref->next;
             }
 
-            CallStack stack;
-            stack.update();
-            stack.dump();
+            CallStack stack(LOG_TAG);
         }
     }
 
@@ -440,39 +431,68 @@ bool RefBase::weakref_type::attemptIncStrong(const void* id)
     incWeak(id);
     
     weakref_impl* const impl = static_cast<weakref_impl*>(this);
-    
     int32_t curCount = impl->mStrong;
-    ALOG_ASSERT(curCount >= 0, "attemptIncStrong called on %p after underflow",
-               this);
+
+    ALOG_ASSERT(curCount >= 0,
+            "attemptIncStrong called on %p after underflow", this);
+
     while (curCount > 0 && curCount != INITIAL_STRONG_VALUE) {
+        // we're in the easy/common case of promoting a weak-reference
+        // from an existing strong reference.
         if (android_atomic_cmpxchg(curCount, curCount+1, &impl->mStrong) == 0) {
             break;
         }
+        // the strong count has changed on us, we need to re-assert our
+        // situation.
         curCount = impl->mStrong;
     }
     
     if (curCount <= 0 || curCount == INITIAL_STRONG_VALUE) {
-        bool allow;
-        if (curCount == INITIAL_STRONG_VALUE) {
-            // Attempting to acquire first strong reference...  this is allowed
-            // if the object does NOT have a longer lifetime (meaning the
-            // implementation doesn't need to see this), or if the implementation
-            // allows it to happen.
-            allow = (impl->mFlags&OBJECT_LIFETIME_WEAK) != OBJECT_LIFETIME_WEAK
-                  || impl->mBase->onIncStrongAttempted(FIRST_INC_STRONG, id);
+        // we're now in the harder case of either:
+        // - there never was a strong reference on us
+        // - or, all strong references have been released
+        if ((impl->mFlags&OBJECT_LIFETIME_WEAK) == OBJECT_LIFETIME_STRONG) {
+            // this object has a "normal" life-time, i.e.: it gets destroyed
+            // when the last strong reference goes away
+            if (curCount <= 0) {
+                // the last strong-reference got released, the object cannot
+                // be revived.
+                decWeak(id);
+                return false;
+            }
+
+            // here, curCount == INITIAL_STRONG_VALUE, which means
+            // there never was a strong-reference, so we can try to
+            // promote this object; we need to do that atomically.
+            while (curCount > 0) {
+                if (android_atomic_cmpxchg(curCount, curCount + 1,
+                        &impl->mStrong) == 0) {
+                    break;
+                }
+                // the strong count has changed on us, we need to re-assert our
+                // situation (e.g.: another thread has inc/decStrong'ed us)
+                curCount = impl->mStrong;
+            }
+
+            if (curCount <= 0) {
+                // promote() failed, some other thread destroyed us in the
+                // meantime (i.e.: strong count reached zero).
+                decWeak(id);
+                return false;
+            }
         } else {
-            // Attempting to revive the object...  this is allowed
-            // if the object DOES have a longer lifetime (so we can safely
-            // call the object with only a weak ref) and the implementation
-            // allows it to happen.
-            allow = (impl->mFlags&OBJECT_LIFETIME_WEAK) == OBJECT_LIFETIME_WEAK
-                  && impl->mBase->onIncStrongAttempted(FIRST_INC_STRONG, id);
+            // this object has an "extended" life-time, i.e.: it can be
+            // revived from a weak-reference only.
+            // Ask the object's implementation if it agrees to be revived
+            if (!impl->mBase->onIncStrongAttempted(FIRST_INC_STRONG, id)) {
+                // it didn't so give-up.
+                decWeak(id);
+                return false;
+            }
+            // grab a strong-reference, which is always safe due to the
+            // extended life-time.
+            curCount = android_atomic_inc(&impl->mStrong);
         }
-        if (!allow) {
-            decWeak(id);
-            return false;
-        }
-        curCount = android_atomic_inc(&impl->mStrong);
 
         // If the strong reference count has already been incremented by
         // someone else, the implementor of onIncStrongAttempted() is holding
@@ -490,11 +510,23 @@ bool RefBase::weakref_type::attemptIncStrong(const void* id)
     ALOGD("attemptIncStrong of %p from %p: cnt=%d\n", this, id, curCount);
 #endif
 
-    if (curCount == INITIAL_STRONG_VALUE) {
-        android_atomic_add(-INITIAL_STRONG_VALUE, &impl->mStrong);
-        impl->mBase->onFirstRef();
+    // now we need to fix-up the count if it was INITIAL_STRONG_VALUE
+    // this must be done safely, i.e.: handle the case where several threads
+    // were here in attemptIncStrong().
+    curCount = impl->mStrong;
+    while (curCount >= INITIAL_STRONG_VALUE) {
+        ALOG_ASSERT(curCount > INITIAL_STRONG_VALUE,
+                "attemptIncStrong in %p underflowed to INITIAL_STRONG_VALUE",
+                this);
+        if (android_atomic_cmpxchg(curCount, curCount-INITIAL_STRONG_VALUE,
+                &impl->mStrong) == 0) {
+            break;
+        }
+        // the strong-count changed on us, we need to re-assert the situation,
+        // for e.g.: it's possible the fix-up happened in another thread.
+        curCount = impl->mStrong;
     }
-    
+
     return true;
 }
 
@@ -595,19 +627,25 @@ void RefBase::onLastWeakRef(const void* /*id*/)
 
 // ---------------------------------------------------------------------------
 
-void RefBase::moveReferences(void* dst, void const* src, size_t n,
-        const ReferenceConverterBase& caster)
-{
+void RefBase::renameRefs(size_t n, const ReferenceRenamer& renamer) {
 #if DEBUG_REFS
-    const size_t itemSize = caster.getReferenceTypeSize();
     for (size_t i=0 ; i<n ; i++) {
-        void*       d = reinterpret_cast<void      *>(intptr_t(dst) + i*itemSize);
-        void const* s = reinterpret_cast<void const*>(intptr_t(src) + i*itemSize);
-        RefBase* ref(reinterpret_cast<RefBase*>(caster.getReferenceBase(d)));
-        ref->mRefs->renameStrongRefId(s, d);
-        ref->mRefs->renameWeakRefId(s, d);
+        renamer(i);
     }
 #endif
+}
+
+void RefBase::renameRefId(weakref_type* ref,
+        const void* old_id, const void* new_id) {
+    weakref_impl* const impl = static_cast<weakref_impl*>(ref);
+    impl->renameStrongRefId(old_id, new_id);
+    impl->renameWeakRefId(old_id, new_id);
+}
+
+void RefBase::renameRefId(RefBase* ref,
+        const void* old_id, const void* new_id) {
+    ref->mRefs->renameStrongRefId(old_id, new_id);
+    ref->mRefs->renameWeakRefId(old_id, new_id);
 }
 
 // ---------------------------------------------------------------------------

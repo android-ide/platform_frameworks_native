@@ -62,16 +62,18 @@ private:
 class MessageQueue {
     class Handler : public MessageHandler {
         enum {
-            eventMaskInvalidate = 0x1,
-            eventMaskRefresh    = 0x2
+            eventMaskInvalidate     = 0x1,
+            eventMaskRefresh        = 0x2,
+            eventMaskTransaction    = 0x4
         };
         MessageQueue& mQueue;
         int32_t mEventMask;
     public:
         Handler(MessageQueue& queue) : mQueue(queue), mEventMask(0) { }
         virtual void handleMessage(const Message& message);
-        void signalRefresh();
-        void signalInvalidate();
+        void dispatchRefresh();
+        void dispatchInvalidate();
+        void dispatchTransaction();
     };
 
     friend class Handler;
@@ -89,8 +91,9 @@ class MessageQueue {
 
 public:
     enum {
-        INVALIDATE = 0,
-        REFRESH    = 1,
+        INVALIDATE  = 0,
+        REFRESH     = 1,
+        TRANSACTION = 2
     };
 
     MessageQueue();
@@ -100,8 +103,13 @@ public:
 
     void waitMessage();
     status_t postMessage(const sp<MessageBase>& message, nsecs_t reltime=0);
+
+    // sends INVALIDATE message at next VSYNC
     void invalidate();
+    // sends REFRESH message at next VSYNC
     void refresh();
+    // sends TRANSACTION message immediately
+    void invalidateTransactionNow();
 };
 
 // ---------------------------------------------------------------------------

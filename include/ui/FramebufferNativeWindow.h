@@ -28,7 +28,8 @@
 #include <ui/ANativeObjectBase.h>
 #include <ui/Rect.h>
 
-#define NUM_FRAME_BUFFERS  2
+#define MIN_NUM_FRAME_BUFFERS  2
+#define MAX_NUM_FRAME_BUFFERS  3
 
 extern "C" EGLNativeWindowType android_createDisplaySurface(void);
 
@@ -65,16 +66,19 @@ private:
     friend class LightRefBase<FramebufferNativeWindow>;    
     ~FramebufferNativeWindow(); // this class cannot be overloaded
     static int setSwapInterval(ANativeWindow* window, int interval);
-    static int dequeueBuffer(ANativeWindow* window, ANativeWindowBuffer** buffer);
-    static int lockBuffer(ANativeWindow* window, ANativeWindowBuffer* buffer);
-    static int queueBuffer(ANativeWindow* window, ANativeWindowBuffer* buffer);
+    static int dequeueBuffer(ANativeWindow* window, ANativeWindowBuffer** buffer, int* fenceFd);
+    static int queueBuffer(ANativeWindow* window, ANativeWindowBuffer* buffer, int fenceFd);
     static int query(const ANativeWindow* window, int what, int* value);
     static int perform(ANativeWindow* window, int operation, ...);
-    
+
+    static int dequeueBuffer_DEPRECATED(ANativeWindow* window, ANativeWindowBuffer** buffer);
+    static int queueBuffer_DEPRECATED(ANativeWindow* window, ANativeWindowBuffer* buffer);
+    static int lockBuffer_DEPRECATED(ANativeWindow* window, ANativeWindowBuffer* buffer);
+
     framebuffer_device_t* fbDev;
     alloc_device_t* grDev;
 
-    sp<NativeBuffer> buffers[NUM_FRAME_BUFFERS];
+    sp<NativeBuffer> buffers[MAX_NUM_FRAME_BUFFERS];
     sp<NativeBuffer> front;
     
     mutable Mutex mutex;

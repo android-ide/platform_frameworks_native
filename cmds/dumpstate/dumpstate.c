@@ -25,7 +25,7 @@
 #include <sys/time.h>
 #include <sys/wait.h>
 #include <unistd.h>
-#include <linux/capability.h>
+#include <sys/capability.h>
 #include <linux/prctl.h>
 
 #include <cutils/properties.h>
@@ -85,10 +85,13 @@ static void dumpstate() {
     dump_file("ZONEINFO", "/proc/zoneinfo");
     dump_file("PAGETYPEINFO", "/proc/pagetypeinfo");
     dump_file("BUDDYINFO", "/proc/buddyinfo");
+    dump_file("FRAGMENTATION INFO", "/d/extfrag/unusable_index");
 
 
     dump_file("KERNEL WAKELOCKS", "/proc/wakelocks");
+    dump_file("KERNEL WAKE SOURCES", "/d/wakeup_sources");
     dump_file("KERNEL CPUFREQ", "/sys/devices/system/cpu/cpu0/cpufreq/stats/time_in_state");
+    dump_file("KERNEL SYNC", "/d/sync");
 
     run_command("PROCESSES", 10, "ps", "-P", NULL);
     run_command("PROCESSES AND THREADS", 10, "ps", "-t", "-p", "-P", NULL);
@@ -98,8 +101,14 @@ static void dumpstate() {
 
     run_command("LIST OF OPEN FILES", 10, SU_PATH, "root", "lsof", NULL);
 
+    if (screenshot_path[0]) {
+        ALOGI("taking screenshot\n");
+        run_command(NULL, 10, "/system/bin/screencap", "-p", screenshot_path, NULL);
+        ALOGI("wrote screenshot: %s\n", screenshot_path);
+    }
+
     for_each_pid(do_showmap, "SMAPS OF ALL PROCESSES");
-    for_each_pid(show_wchan, "BLOCKED PROCESS WAIT-CHANNELS");
+    for_each_tid(show_wchan, "BLOCKED PROCESS WAIT-CHANNELS");
 
     // dump_file("EVENT LOG TAGS", "/etc/event-log-tags");
     run_command("SYSTEM LOG", 20, "logcat", "-v", "threadtime", "-d", "*:v", NULL);
@@ -156,15 +165,9 @@ static void dumpstate() {
     dump_file("LAST PANIC CONSOLE", "/data/dontpanic/apanic_console");
     dump_file("LAST PANIC THREADS", "/data/dontpanic/apanic_threads");
 
-    if (screenshot_path[0]) {
-        ALOGI("taking screenshot\n");
-        run_command(NULL, 5, SU_PATH, "root", "screenshot", screenshot_path, NULL);
-        ALOGI("wrote screenshot: %s\n", screenshot_path);
-    }
-
     run_command("SYSTEM SETTINGS", 20, SU_PATH, "root", "sqlite3",
             "/data/data/com.android.providers.settings/databases/settings.db",
-            "pragma user_version; select * from system; select * from secure;", NULL);
+            "pragma user_version; select * from system; select * from secure; select * from global;", NULL);
 
     /* The following have a tendency to get wedged when wifi drivers/fw goes belly-up. */
     run_command("NETWORK INTERFACES", 10, SU_PATH, "root", "netcfg", NULL);
@@ -185,28 +188,35 @@ static void dumpstate() {
     run_command("WIFI NETWORKS", 20,
             SU_PATH, "root", "wpa_cli", "list_networks", NULL);
 
+#ifdef FWDUMP_bcmdhd
+    run_command("DUMP WIFI INTERNAL COUNTERS", 20,
+            SU_PATH, "root", "wlutil", "counters", NULL);
+#endif
+    dump_file("INTERRUPTS (1)", "/proc/interrupts");
+
     property_get("dhcp.wlan0.gateway", network, "");
     if (network[0])
-        run_command("PING GATEWAY", 10, SU_PATH, "root", "ping", "-c", "3", "-i", ".5", network, NULL);
+        run_command("PING GATEWAY", 10, "ping", "-c", "3", "-i", ".5", network, NULL);
     property_get("dhcp.wlan0.dns1", network, "");
     if (network[0])
-        run_command("PING DNS1", 10, SU_PATH, "root", "ping", "-c", "3", "-i", ".5", network, NULL);
+        run_command("PING DNS1", 10, "ping", "-c", "3", "-i", ".5", network, NULL);
     property_get("dhcp.wlan0.dns2", network, "");
     if (network[0])
-        run_command("PING DNS2", 10, SU_PATH, "root", "ping", "-c", "3", "-i", ".5", network, NULL);
-#ifdef FWDUMP_bcm4329
+        run_command("PING DNS2", 10, "ping", "-c", "3", "-i", ".5", network, NULL);
+#ifdef FWDUMP_bcmdhd
     run_command("DUMP WIFI STATUS", 20,
             SU_PATH, "root", "dhdutil", "-i", "wlan0", "dump", NULL);
     run_command("DUMP WIFI INTERNAL COUNTERS", 20,
             SU_PATH, "root", "wlutil", "counters", NULL);
 #endif
+    dump_file("INTERRUPTS (2)", "/proc/interrupts");
 
     print_properties();
 
     run_command("VOLD DUMP", 10, "vdc", "dump", NULL);
     run_command("SECURE CONTAINERS", 10, "vdc", "asec", "list", NULL);
 
-    run_command("FILESYSTEMS & FREE SPACE", 10, SU_PATH, "root", "df", NULL);
+    run_command("FILESYSTEMS & FREE SPACE", 10, "df", NULL);
 
     run_command("PACKAGE SETTINGS", 20, SU_PATH, "root", "cat", "/data/system/packages.xml", NULL);
     dump_file("PACKAGE UID ERRORS", "/data/system/uiderrors.txt");
@@ -301,10 +311,17 @@ static void usage() {
             "  -b: play sound file instead of vibrate, at beginning of job\n"
             "  -e: play sound file instead of vibrate, at end of job\n"
             "  -q: disable vibrate\n"
+            "  -B: send broadcast when finished (requires -o and -p)\n"
 		);
 }
 
+static void sigpipe_handler(int n) {
+    (void)n;
+    exit(EXIT_FAILURE);
+}
+
 int main(int argc, char *argv[]) {
+    struct sigaction sigact;
     int do_add_date = 0;
     int do_compress = 0;
     int do_vibrate = 1;
@@ -313,10 +330,21 @@ int main(int argc, char *argv[]) {
     char* end_sound = 0;
     int use_socket = 0;
     int do_fb = 0;
+    int do_broadcast = 0;
 
+    if (getuid() != 0) {
+        // Old versions of the adb client would call the
+        // dumpstate command directly. Newer clients
+        // call /system/bin/bugreport instead. If we detect
+        // we're being called incorrectly, then exec the
+        // correct program.
+        return execl("/system/bin/bugreport", "/system/bin/bugreport", NULL);
+    }
     ALOGI("begin\n");
 
-    signal(SIGPIPE, SIG_IGN);
+    memset(&sigact, 0, sizeof(sigact));
+    sigact.sa_handler = sigpipe_handler;
+    sigaction(SIGPIPE, &sigact, NULL);
 
     /* set as high priority, and protect from OOM killer */
     setpriority(PRIO_PROCESS, 0, -20);
@@ -330,7 +358,7 @@ int main(int argc, char *argv[]) {
     dump_traces_path = dump_traces();
 
     int c;
-    while ((c = getopt(argc, argv, "b:de:ho:svqzp")) != -1) {
+    while ((c = getopt(argc, argv, "b:de:ho:svqzpB")) != -1) {
         switch (c) {
             case 'b': begin_sound = optarg;  break;
             case 'd': do_add_date = 1;       break;
@@ -341,6 +369,7 @@ int main(int argc, char *argv[]) {
             case 'q': do_vibrate = 0;        break;
             case 'z': do_compress = 6;       break;
             case 'p': do_fb = 1;             break;
+            case 'B': do_broadcast = 1;      break;
             case '?': printf("\n");
             case 'h':
                 usage();
@@ -362,44 +391,42 @@ int main(int argc, char *argv[]) {
         fclose(cmdline);
     }
 
-    if (getuid() == 0) {
-        if (prctl(PR_SET_KEEPCAPS, 1) < 0) {
-            ALOGE("prctl(PR_SET_KEEPCAPS) failed: %s\n", strerror(errno));
-            return -1;
-        }
+    if (prctl(PR_SET_KEEPCAPS, 1) < 0) {
+        ALOGE("prctl(PR_SET_KEEPCAPS) failed: %s\n", strerror(errno));
+        return -1;
+    }
 
-        /* switch to non-root user and group */
-        gid_t groups[] = { AID_LOG, AID_SDCARD_R, AID_SDCARD_RW,
-                AID_MOUNT, AID_INET, AID_NET_BW_STATS };
-        if (setgroups(sizeof(groups)/sizeof(groups[0]), groups) != 0) {
-            ALOGE("Unable to setgroups, aborting: %s\n", strerror(errno));
-            return -1;
-        }
-        if (setgid(AID_SHELL) != 0) {
-            ALOGE("Unable to setgid, aborting: %s\n", strerror(errno));
-            return -1;
-        }
-        if (setuid(AID_SHELL) != 0) {
-            ALOGE("Unable to setuid, aborting: %s\n", strerror(errno));
-            return -1;
-        }
+    /* switch to non-root user and group */
+    gid_t groups[] = { AID_LOG, AID_SDCARD_R, AID_SDCARD_RW,
+            AID_MOUNT, AID_INET, AID_NET_BW_STATS };
+    if (setgroups(sizeof(groups)/sizeof(groups[0]), groups) != 0) {
+        ALOGE("Unable to setgroups, aborting: %s\n", strerror(errno));
+        return -1;
+    }
+    if (setgid(AID_SHELL) != 0) {
+        ALOGE("Unable to setgid, aborting: %s\n", strerror(errno));
+        return -1;
+    }
+    if (setuid(AID_SHELL) != 0) {
+        ALOGE("Unable to setuid, aborting: %s\n", strerror(errno));
+        return -1;
+    }
 
-        struct __user_cap_header_struct capheader;
-        struct __user_cap_data_struct capdata[2];
-        memset(&capheader, 0, sizeof(capheader));
-        memset(&capdata, 0, sizeof(capdata));
-        capheader.version = _LINUX_CAPABILITY_VERSION_3;
-        capheader.pid = 0;
+    struct __user_cap_header_struct capheader;
+    struct __user_cap_data_struct capdata[2];
+    memset(&capheader, 0, sizeof(capheader));
+    memset(&capdata, 0, sizeof(capdata));
+    capheader.version = _LINUX_CAPABILITY_VERSION_3;
+    capheader.pid = 0;
 
-        capdata[CAP_TO_INDEX(CAP_SYSLOG)].permitted = CAP_TO_MASK(CAP_SYSLOG);
-        capdata[CAP_TO_INDEX(CAP_SYSLOG)].effective = CAP_TO_MASK(CAP_SYSLOG);
-        capdata[0].inheritable = 0;
-        capdata[1].inheritable = 0;
+    capdata[CAP_TO_INDEX(CAP_SYSLOG)].permitted = CAP_TO_MASK(CAP_SYSLOG);
+    capdata[CAP_TO_INDEX(CAP_SYSLOG)].effective = CAP_TO_MASK(CAP_SYSLOG);
+    capdata[0].inheritable = 0;
+    capdata[1].inheritable = 0;
 
-        if (capset(&capheader, &capdata[0]) < 0) {
-            ALOGE("capset failed: %s\n", strerror(errno));
-            return -1;
-        }
+    if (capset(&capheader, &capdata[0]) < 0) {
+        ALOGE("capset failed: %s\n", strerror(errno));
+        return -1;
     }
 
     char path[PATH_MAX], tmp_path[PATH_MAX];
@@ -456,6 +483,14 @@ int main(int argc, char *argv[]) {
     /* rename the (now complete) .tmp file to its final location */
     if (use_outfile && rename(tmp_path, path)) {
         fprintf(stderr, "rename(%s, %s): %s\n", tmp_path, path, strerror(errno));
+    }
+
+    if (do_broadcast && use_outfile && do_fb) {
+        run_command(NULL, 5, "/system/bin/am", "broadcast", "--user", "0",
+                "-a", "android.intent.action.BUGREPORT_FINISHED",
+                "--es", "android.intent.extra.BUGREPORT", path,
+                "--es", "android.intent.extra.SCREENSHOT", screenshot_path,
+                "--receiver-permission", "android.permission.DUMP", NULL);
     }
 
     ALOGI("done\n");

@@ -46,7 +46,27 @@ public class JType {
     typeMapping.put(new CType("GLubyte", true, true), new JType("String", false, false));
     typeMapping.put(new CType("char", false, true), new JType("byte"));
     typeMapping.put(new CType("char", true, true), new JType("String", false, false));
+    typeMapping.put(new CType("GLchar", true, true), new JType("String", false, false));
     typeMapping.put(new CType("int"), new JType("int"));
+    typeMapping.put(new CType("GLuint64"), new JType("long"));
+    typeMapping.put(new CType("GLsync"), new JType("long"));
+
+    // EGL primitive types
+    typeMapping.put(new CType("EGLint"), new JType("int"));
+    typeMapping.put(new CType("EGLBoolean"), new JType("boolean"));
+    typeMapping.put(new CType("EGLenum"), new JType("int"));
+    typeMapping.put(new CType("EGLNativePixmapType"), new JType("int"));
+    typeMapping.put(new CType("EGLNativeWindowType"), new JType("int"));
+    typeMapping.put(new CType("EGLNativeDisplayType"), new JType("int"));
+    typeMapping.put(new CType("EGLClientBuffer"), new JType("int"));
+    typeMapping.put(new CType("EGLnsecsANDROID"), new JType("long"));
+
+    // EGL nonprimitive types
+    typeMapping.put(new CType("EGLConfig"), new JType("EGLConfig", true, false));
+    typeMapping.put(new CType("EGLContext"), new JType("EGLContext", true, false));
+    typeMapping.put(new CType("EGLDisplay"), new JType("EGLDisplay", true, false));
+    typeMapping.put(new CType("EGLSurface"), new JType("EGLSurface", true, false));
+
 
     // Untyped pointers map to untyped Buffers
     typeMapping.put(new CType("GLvoid", true, true),
@@ -62,6 +82,8 @@ public class JType {
     typeMapping.put(new CType("GLboolean", false, true),
             new JType("java.nio.IntBuffer", true, false));
     typeMapping.put(new CType("GLenum", false, true),
+            new JType("java.nio.IntBuffer", true, false));
+    typeMapping.put(new CType("GLenum", true, true),
             new JType("java.nio.IntBuffer", true, false));
     typeMapping.put(new CType("GLfixed", false, true),
             new JType("java.nio.IntBuffer", true, false));
@@ -83,13 +105,16 @@ public class JType {
             new JType("java.nio.IntBuffer", true, false));
     typeMapping.put(new CType("GLshort", true, true),
             new JType("java.nio.ShortBuffer", true, false));
+    typeMapping.put(new CType("GLint64", false, true),
+            new JType("java.nio.LongBuffer", true, false));
 
     // Typed pointers map to arrays + offsets
     arrayTypeMapping.put(new CType("char", false, true),
             new JType("byte", false, true));
     arrayTypeMapping.put(new CType("GLboolean", false, true),
-                 new JType("boolean", false, true));
+            new JType("boolean", false, true));
     arrayTypeMapping.put(new CType("GLenum", false, true), new JType("int", false, true));
+    arrayTypeMapping.put(new CType("GLenum", true, true), new JType("int", false, true));
     arrayTypeMapping.put(new CType("GLfixed", true, true), new JType("int", false, true));
     arrayTypeMapping.put(new CType("GLfixed", false, true), new JType("int", false, true));
     arrayTypeMapping.put(new CType("GLfloat", false, true), new JType("float", false, true));
@@ -103,6 +128,14 @@ public class JType {
     arrayTypeMapping.put(new CType("GLuint", true, true), new JType("int", false, true));
     arrayTypeMapping.put(new CType("GLintptr"), new JType("int", false, true));
     arrayTypeMapping.put(new CType("GLsizeiptr"), new JType("int", false, true));
+    arrayTypeMapping.put(new CType("GLint64", false, true), new JType("long", false, true));
+
+    //EGL typed pointers map to arrays + offsets
+    arrayTypeMapping.put(new CType("EGLint", false, true), new JType("int", false, true));
+    arrayTypeMapping.put(new CType("EGLint", true, true), new JType("int", false, true));
+    arrayTypeMapping.put(new CType("EGLConfig", false, true), new JType("EGLConfig", true, true));
+    arrayTypeMapping.put(new CType("EGLConfig", true, true), new JType("EGLConfig", true, true));
+
     }
 
     public JType() {
@@ -156,6 +189,11 @@ public class JType {
     public boolean isTypedBuffer() {
     return !baseType.equals("java.nio.Buffer") &&
         (baseType.indexOf("Buffer") != -1);
+    }
+
+    public boolean isEGLHandle() {
+    return !isPrimitive() &&
+        (baseType.startsWith("EGL"));
     }
 
     public static JType convert(CType ctype, boolean useArray) {

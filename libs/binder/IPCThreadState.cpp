@@ -371,11 +371,6 @@ int IPCThreadState::getCallingUid()
     return mCallingUid;
 }
 
-int IPCThreadState::getOrigCallingUid()
-{
-    return mOrigCallingUid;
-}
-
 int64_t IPCThreadState::clearCallingIdentity()
 {
     int64_t token = ((int64_t)mCallingUid<<32) | mCallingPid;
@@ -471,6 +466,10 @@ void IPCThreadState::joinThreadPool(bool isMain)
 
 
             result = executeCommand(cmd);
+        } else if (result != TIMED_OUT && result != -ECONNREFUSED && result != -EBADF) {
+            ALOGE("talkWithDriver(fd=%d) returned unexpected error %d, aborting",
+                  mProcess->mDriverFD, result);
+            abort();
         }
         
         // After executing the command, ensure that the thread is returned to the
@@ -646,7 +645,6 @@ IPCThreadState::IPCThreadState()
 {
     pthread_setspecific(gTLS, this);
     clearCaller();
-    mOrigCallingUid = mCallingUid;
     mIn.setDataCapacity(256);
     mOut.setDataCapacity(256);
 }
@@ -998,7 +996,6 @@ status_t IPCThreadState::executeCommand(int32_t cmd)
             
             mCallingPid = tr.sender_pid;
             mCallingUid = tr.sender_euid;
-            mOrigCallingUid = tr.sender_euid;
             
             int curPrio = getpriority(PRIO_PROCESS, mMyThreadId);
             if (gDisableBackgroundScheduling) {
@@ -1056,7 +1053,6 @@ status_t IPCThreadState::executeCommand(int32_t cmd)
             
             mCallingPid = origPid;
             mCallingUid = origUid;
-            mOrigCallingUid = origUid;
 
             IF_LOG_TRANSACTIONS() {
                 TextOutput::Bundle _b(alog);

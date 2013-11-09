@@ -23,28 +23,31 @@
 #include <utils/Vector.h>
 
 #include <ui/Rect.h>
+#include <utils/Flattenable.h>
 
 namespace android {
 // ---------------------------------------------------------------------------
 
+class SharedBuffer;
 class String8;
 
 // ---------------------------------------------------------------------------
-class Region
+class Region : public LightFlattenable<Region>
 {
 public:
                         Region();
                         Region(const Region& rhs);
     explicit            Region(const Rect& rhs);
-    explicit            Region(const void* buffer);
                         ~Region();
-                        
+
+    static  Region      createTJunctionFreeRegion(const Region& r);
+
         Region& operator = (const Region& rhs);
 
-    inline  bool        isEmpty() const     { return mBounds.isEmpty();  }
-    inline  bool        isRect() const      { return mStorage.isEmpty(); }
+    inline  bool        isEmpty() const     { return getBounds().isEmpty(); }
+    inline  bool        isRect() const      { return mStorage.size() == 1; }
 
-    inline  Rect        getBounds() const   { return mBounds; }
+    inline  Rect        getBounds() const   { return mStorage[mStorage.size() - 1]; }
     inline  Rect        bounds() const      { return getBounds(); }
 
             // the region becomes its bounds
@@ -105,29 +108,37 @@ public:
     inline  Region&     operator += (const Point& pt);
 
     
+    // returns true if the regions share the same underlying storage
+    bool isTriviallyEqual(const Region& region) const;
+
+
     /* various ways to access the rectangle list */
+
     
+    // STL-like iterators
     typedef Rect const* const_iterator;
-    
-            const_iterator begin() const;
-            const_iterator end() const;
+    const_iterator begin() const;
+    const_iterator end() const;
+
+    // returns an array of rect which has the same life-time has this
+    // Region object.
+    Rect const* getArray(size_t* count) const;
+
+    // returns a SharedBuffer as well as the number of rects.
+    // ownership is transfered to the caller.
+    // the caller must call SharedBuffer::release() to free the memory.
+    SharedBuffer const* getSharedBuffer(size_t* count) const;
 
     /* no user serviceable parts here... */
-            
-            size_t      getRects(Vector<Rect>& rectList) const;
-            Rect const* getArray(size_t* count) const;
-
             
             // add a rectangle to the internal list. This rectangle must
             // be sorted in Y and X and must not make the region invalid.
             void        addRectUnchecked(int l, int t, int r, int b);
 
-            // flatten/unflatten a region to/from a raw buffer
-            ssize_t     write(void* buffer, size_t size) const;
-    static  ssize_t     writeEmpty(void* buffer, size_t size);
-
-            ssize_t     read(const void* buffer);
-    static  bool        isEmpty(void* buffer);
+    inline  bool        isFixedSize() const { return false; }
+            size_t      getSize() const;
+            status_t    flatten(void* buffer) const;
+            status_t    unflatten(void const* buffer, size_t size);
 
     void        dump(String8& out, const char* what, uint32_t flags=0) const;
     void        dump(const char* what, uint32_t flags=0) const;
@@ -156,10 +167,14 @@ private:
     static void translate(Region& reg, int dx, int dy);
     static void translate(Region& dst, const Region& reg, int dx, int dy);
 
-    static bool validate(const Region& reg, const char* name);
+    static bool validate(const Region& reg,
+            const char* name, bool silent = false);
     
-    Rect            mBounds;
-    Vector<Rect>    mStorage;
+    // mStorage is a (manually) sorted array of Rects describing the region
+    // with an extra Rect as the last element which is set to the
+    // bounds of the region. However, if the region is
+    // a simple Rect then mStorage contains only that rect.
+    Vector<Rect> mStorage;
 };
 
 
