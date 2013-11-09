@@ -75,7 +75,9 @@ include $(CLEAR_VARS)
 LOCAL_SRC_FILES:= \
 	$(commonSources) \
 	Looper.cpp \
-	Trace.cpp
+
+# Trace.cpp requires HAVE_ANDROID_OS now
+#	Trace.cpp
 
 ifeq ($(TARGET_OS),linux)
 LOCAL_LDLIBS += -lrt -ldl
